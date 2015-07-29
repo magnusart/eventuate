@@ -21,7 +21,7 @@ import java.util.concurrent.TimeUnit
 
 import akka.util.Helpers.Requiring
 
-import com.datastax.driver.core.{Cluster, ConsistencyLevel}
+import com.datastax.driver.core.{Cluster, ConsistencyLevel, SSLOptions}
 import com.typesafe.config.Config
 
 import com.rbmhtechnology.eventuate.ReplicationSettings
@@ -73,10 +73,28 @@ private[eventuate] class CassandraSettings(config: Config) {
   val indexUpdateLimit: Int =
     config.getInt("eventuate.log.cassandra.index-update-limit")
 
-  val clusterBuilder: Cluster.Builder =
-    Cluster.builder.addContactPointsWithPorts(contactPoints.asJava).withCredentials(
+  def sslClusterBuilder(clusterBuilder:Cluster.Builder):Cluster.Builder = {
+    val trustStorePath: String = config.getString("eventuate.log.cassandra.ssl.truststore.path")
+    val trustStorePW: String = config.getString("eventuate.log.cassandra.ssl.truststore.password")
+    val keyStorePath: String = config.getString("eventuate.log.cassandra.ssl.keystore.path")
+    val keyStorePW: String = config.getString("eventuate.log.cassandra.ssl.keystore.password")
+    
+    val context = CassandraSslSetup.constructContext(
+      trustStorePath,
+      trustStorePW,
+      keyStorePath,
+      keyStorePW )
+
+    clusterBuilder.withSSL(new SSLOptions(context,SSLOptions.DEFAULT_SSL_CIPHER_SUITES))
+  }
+
+  def buildClusterBuilder = Cluster.builder.addContactPointsWithPorts(contactPoints.asJava).withCredentials(
       config.getString("eventuate.log.cassandra.username"),
       config.getString("eventuate.log.cassandra.password"))
+
+  val clusterBuilder: Cluster.Builder = 
+    if(config.hasPath("eventuate.log.cassandra.ssl")) sslClusterBuilder( buildClusterBuilder )
+    else buildClusterBuilder
 }
 
 private object CassandraSettings {
