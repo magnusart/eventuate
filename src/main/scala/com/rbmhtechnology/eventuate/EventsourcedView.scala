@@ -51,17 +51,41 @@ private object EventsourcedView {
  * @see [[EventsourcedActor]]
  * @see [[DurableEvent]]
  */
-trait EventsourcedView extends Actor with ConditionalCommands with InternalStash with ActorLogging {
+trait EventsourcedView extends Actor with ConditionalCommands with Stash with ActorLogging {
   import EventsourcedView._
 
   type Handler[A] = Try[A] => Unit
 
+  val instanceId: Int = instanceIdCounter.getAndIncrement()
+
+  private var _recovering: Boolean = true
+  private var _lastHandledEvent: DurableEvent = _
+  private var _clock: VectorClock = _
+
   private var saveRequests: Map[SnapshotMetadata, Handler[SnapshotMetadata]] = Map.empty
 
-  private var _lastEvent: DurableEvent = _
-  private var _recovering: Boolean = true
+  /**
+   * Internal API.
+   */
+  private[eventuate] val messageStash = new MessageStash()
 
-  val instanceId: Int = instanceIdCounter.getAndIncrement()
+  /**
+   * Optional aggregate id. It is used for routing [[DurableEvent]]s to event-sourced destinations
+   * which can be [[EventsourcedView]]s or [[EventsourcedActor]]s. By default, an event is routed
+   * to an event-sourced destination with an undefined `aggregateId`. If a destination's `aggregateId`
+   * is defined it will only receive events with a matching aggregate id in
+   * [[DurableEvent#destinationAggregateIds]].
+   */
+  def aggregateId: Option[String] =
+    None
+
+  /**
+   * If `true`, this actor shares a vector clock entry with those actors on the same local `eventLog`
+   * that have set `sharedClockEntry` to `true` as well. Otherwise, this actor has its own entry in
+   * the vector clock.
+   */
+  def sharedClockEntry: Boolean =
+    true
 
   /**
    * Global unique actor id.
@@ -92,47 +116,8 @@ trait EventsourcedView extends Actor with ConditionalCommands with InternalStash
   /**
    * Called after recovery successfully completed. Can be overridden by implementations.
    */
-  def onRecovered(): Unit = ()
-
-  /**
-   * Optional aggregate id. It is used for routing [[DurableEvent]]s to event-sourced destinations
-   * which can be [[EventsourcedView]]s or [[EventsourcedActor]]s. By default, an event is routed
-   * to an event-sourced destination with an undefined `aggregateId`. If a destination's `aggregateId`
-   * is defined it will only receive events with a matching aggregate id in
-   * [[DurableEvent#destinationAggregateIds]].
-   */
-  def aggregateId: Option[String] =
-    None
-
-  /**
-   * Sequence number of the last handled event.
-   */
-  final def lastSequenceNr: Long =
-    lastEvent.sequenceNr
-
-  /**
-   * Wall-clock timestamp of the last handled event.
-   */
-  final def lastSystemTimestamp: Long =
-    lastEvent.systemTimestamp
-
-  /**
-   * Vector timestamp of the last handled event.
-   */
-  final def lastVectorTimestamp: VectorTime =
-    lastEvent.vectorTimestamp
-
-  /**
-   * Emitter aggregate id of the last handled event.
-   */
-  final def lastEmitterAggregateId: Option[String] =
-    lastEvent.emitterAggregateId
-
-  /**
-   * Emitter id of the last handled event.
-   */
-  final def lastEmitterId: String =
-    lastEvent.emitterId
+  def onRecovered(): Unit =
+    ()
 
   /**
    * Returns `true` if this actor is currently recovering internal state by consuming
@@ -143,117 +128,153 @@ trait EventsourcedView extends Actor with ConditionalCommands with InternalStash
     _recovering
 
   /**
-   * Asynchronously saves the given `snapshot` and calls `handler` with the generated
-   * snapshot metadata. The `handler` can also obtain a reference to the initial message
-   * sender via `sender()`.
-   */
-  def save(snapshot: Any)(handler: Handler[SnapshotMetadata]): Unit = {
-    val metadata = SnapshotMetadata(id, lastSequenceNr, lastSystemTimestamp, lastVectorTimestamp)
-    val payload = snapshot match {
-      case tree: ConcurrentVersionsTree[_, _] => tree.copy()
-      case other                              => other
-    }
-    if (saveRequests.contains(metadata)) {
-      handler(Failure(new IllegalStateException(s"snapshot with metadata ${metadata} is currently being saved")))
-    } else {
-      saveRequests += (metadata -> handler)
-      val enriched = enrich(Snapshot(metadata, payload = payload))
-      eventLog ! SaveSnapshot(enriched, sender(), self, instanceId)
-    }
-  }
-
-  /**
-   * Sends a [[EventsourcingProtocol#LoadSnapshot LoadSnapshot]] command to the event log.
-   * Can be overridden by implementations to customize snapshot loading.
-   */
-  def load(): Unit =
-    eventLog ! LoadSnapshot(id, self, instanceId)
-
-  /**
-   * Sends a [[EventsourcingProtocol#Replay Replay]] command to the event log. Can be overridden
-   * by implementations to customize replay.
-   */
-  //#replay
-  def replay(fromSequenceNr: Long = 1L): Unit =
-    eventLog ! Replay(fromSequenceNr, self, aggregateId, instanceId)
-  //#
-
-  /**
    * Internal API.
-   */
-  private[eventuate] def enrich(snapshot: Snapshot): Snapshot =
-    snapshot
-
-  /**
-   * Internal API.
-   */
-  private[eventuate] def lastEvent: DurableEvent =
-    _lastEvent
-
-  /**
-   * Internal API.
-   */
-  private[eventuate] def lastEvent_=(event: DurableEvent): Unit =
-    _lastEvent = event
-
-  /**
-   * Internal API.
-   *
-   * Called if a received `msg` is not an internal message handled by `EventsourcedView`.
-   * Calls [[onCommand]].
-   */
-  private[eventuate] def unhandledMessage(msg: Any): Unit =
-    onCommand(msg)
-
-  /**
-   * Internal API.
-   *
-   * Called if a received `event` is not handled by `onEvent`.
-   */
-  private[eventuate] def unhandledEvent(event: DurableEvent): Unit =
-    ()
-
-  /**
-   * Internal API.
-   *
-   * Called before a loaded `snapshot` is handled by `onSnapshot`.
-   */
-  private[eventuate] def preOnSnapshot(snapshot: Snapshot): Unit = {
-    import snapshot.metadata._
-    _lastEvent = DurableEvent(payload = null, systemTimestamp = systemTimestamp, vectorTimestamp = vectorTimestamp, emitterId = emitterId, targetLogSequenceNr = sequenceNr)
-  }
-
-
-  /**
-   * Internal API.
-   *
-   * Called before a received `event` is handled by `onEvent`.
-   */
-  private[eventuate] def preOnEvent(event: DurableEvent): Unit =
-    ()
-
-  /**
-   * Internal API.
-   *
-   * Called after a received `event` has been handled by `onEvent`.
-   */
-  private[eventuate] def postOnEvent(event: DurableEvent): Unit =
-    if (!recovering) conditionChanged(event.vectorTimestamp)
-
-  /**
-   * Internal API.
-   *
-   * Called after recovery successfully completed.
    */
   private[eventuate] def recovered(): Unit = {
     _recovering = false
     onRecovered()
   }
 
+  /**
+   * Internal API.
+   */
+  private[eventuate] def onEventInternal(event: DurableEvent): Unit = {
+    _lastHandledEvent = event
+
+    if (sharedClockEntry) {
+      // set local clock to local time (= sequence number) of event log
+      _clock = _clock.set(event.logId, event.sequenceNr)
+      if (event.emitterId != id)
+         // merge clock with non-self-emitted event timestamp
+        _clock = _clock.merge(event.vectorTimestamp)
+    } else {
+      if (event.emitterId != id)
+        // update clock with non-self-emitted event timestamp (incl. increment of local time)
+        _clock = _clock.update(event.vectorTimestamp)
+      else if (recovering)
+        // merge clock with self-emitted event timestamp only during recovery
+        _clock = _clock.merge(event.vectorTimestamp)
+    }
+  }
+
+  /**
+   * Internal API.
+   */
+  private[eventuate] def onEventInternal(event: DurableEvent, failure: Throwable): Unit = {
+    _lastHandledEvent = event
+  }
+
+  /**
+   * Internal API.
+   */
+  private[eventuate] def lastHandledEvent: DurableEvent =
+    _lastHandledEvent
+
+  /**
+   * Internal API.
+   */
+  private[eventuate] def currentTime: VectorTime =
+    _clock.currentTime
+
+  /**
+   * Internal API.
+   */
+  private[eventuate] def incrementLocalTime: VectorTime = {
+    _clock = _clock.tick()
+    _clock.currentTime
+  }
+
+  /**
+   * Sequence number of the last handled event.
+   */
+  final def lastSequenceNr: Long =
+    lastHandledEvent.sequenceNr
+
+  /**
+   * Wall-clock timestamp of the last handled event.
+   */
+  final def lastSystemTimestamp: Long =
+    lastHandledEvent.systemTimestamp
+
+  /**
+   * Vector timestamp of the last handled event.
+   */
+  final def lastVectorTimestamp: VectorTime =
+    lastHandledEvent.vectorTimestamp
+
+  /**
+   * Emitter aggregate id of the last handled event.
+   */
+  final def lastEmitterAggregateId: Option[String] =
+    lastHandledEvent.emitterAggregateId
+
+  /**
+   * Emitter id of the last handled event.
+   */
+  final def lastEmitterId: String =
+    lastHandledEvent.emitterId
+
+  /**
+   * Asynchronously saves the given `snapshot` and calls `handler` with the generated
+   * snapshot metadata. The `handler` can obtain a reference to the initial message
+   * sender with `sender()`.
+   */
+  def save(snapshot: Any)(handler: Handler[SnapshotMetadata]): Unit = {
+    val payload = snapshot match {
+      case tree: ConcurrentVersionsTree[_, _] => tree.copy()
+      case other                              => other
+    }
+
+    val prototype = Snapshot(payload, id, lastHandledEvent, currentTime)
+    val metadata = prototype.metadata
+
+    if (saveRequests.contains(metadata)) {
+      handler(Failure(new IllegalStateException(s"snapshot with metadata ${metadata} is currently being saved")))
+    } else {
+      saveRequests += (metadata -> handler)
+      val snapshot = capturedSnapshot(prototype)
+      eventLog ! SaveSnapshot(snapshot, sender(), self, instanceId)
+    }
+  }
+
+  /**
+   * Internal API.
+   */
+  private[eventuate] def capturedSnapshot(snapshot: Snapshot): Snapshot =
+    snapshot
+
+  /**
+   * Internal API.
+   */
+  private[eventuate] def loadedSnapshot(snapshot: Snapshot): Unit = {
+    _lastHandledEvent = snapshot.lastEvent
+    _clock = _clock.copy(currentTime = snapshot.currentTime)
+  }
+
+  /**
+   * Internal API.
+   */
+  private[eventuate] def unhandledMessage(msg: Any): Unit =
+    onCommand(msg)
+
+  /**
+   * Sends a [[EventsourcingProtocol#LoadSnapshot LoadSnapshot]] command to the event log.
+   */
+  private def load(): Unit =
+    eventLog ! LoadSnapshot(id, self, instanceId)
+
+  /**
+   * Sends a [[EventsourcingProtocol#Replay Replay]] command to the event log.
+   */
+  //#replay
+  private def replay(fromSequenceNr: Long = 1L): Unit =
+    eventLog ! Replay(fromSequenceNr, self, aggregateId, instanceId)
+  //#
+
   private def initiating: Receive = {
     case LoadSnapshotSuccess(Some(snapshot), iid) => if (iid == instanceId) {
       if (onSnapshot.isDefinedAt(snapshot.payload)) {
-        preOnSnapshot(snapshot)
+        loadedSnapshot(snapshot)
         onSnapshot(snapshot.payload)
         replay(snapshot.metadata.sequenceNr + 1L)
       } else {
@@ -265,7 +286,6 @@ trait EventsourcedView extends Actor with ConditionalCommands with InternalStash
       replay()
     }
     case LoadSnapshotFailure(cause, iid) => if (iid == instanceId) {
-      log.error(cause, s"snapshot loading failed, replaying from scratch")
       replay()
     }
     case Replaying(event, iid) => if (iid == instanceId) {
@@ -274,7 +294,7 @@ trait EventsourcedView extends Actor with ConditionalCommands with InternalStash
     case ReplaySuccess(iid) => if (iid == instanceId) {
       context.become(initiated)
       conditionChanged(lastVectorTimestamp)
-      internalUnstashAll()
+      messageStash.unstashAll()
       recovered()
     }
     case ReplayFailure(cause, iid) => if (iid == instanceId) {
@@ -282,7 +302,7 @@ trait EventsourcedView extends Actor with ConditionalCommands with InternalStash
       context.stop(self)
     }
     case other =>
-      internalStash()
+      messageStash.stash()
   }
 
   private def initiated: Receive = {
@@ -303,13 +323,16 @@ trait EventsourcedView extends Actor with ConditionalCommands with InternalStash
       unhandledMessage(msg)
   }
 
-  private def receiveEvent(event: DurableEvent): Unit =
+  private def receiveEvent(event: DurableEvent): Unit = {
     if (onEvent.isDefinedAt(event.payload)) {
-      lastEvent = event
-      preOnEvent(event)
+      onEventInternal(event)
       onEvent(event.payload)
-      postOnEvent(event)
-    } else unhandledEvent(event)
+    }
+
+    if (!recovering) {
+      conditionChanged(event.vectorTimestamp)
+    }
+  }
 
   /**
    * Initialization behavior.
@@ -317,12 +340,25 @@ trait EventsourcedView extends Actor with ConditionalCommands with InternalStash
   final def receive = initiating
 
   /**
-   * Initiates recovery by calling [[load]].
+   * Initiates recovery.
    */
   override def preStart(): Unit = {
-    _lastEvent = DurableEvent(payload = null, systemTimestamp = 0L, vectorTimestamp = VectorTime(), emitterId = id, targetLogSequenceNr = 0L)
+    _lastHandledEvent = DurableEvent(id)
+    _clock = VectorClock(id)
     load()
   }
+
+  /**
+   * Unstashes all commands from internal stash and calls `super.preRestart`.
+   */
+  override def preRestart(reason: Throwable, message: Option[Any]): Unit =
+    try messageStash.unstashAll() finally super.preRestart(reason, message)
+
+  /**
+   * Unstashes all commands from internal stash and calls `super.postStop`.
+   */
+  override def postStop(): Unit =
+    try messageStash.unstashAll() finally super.postStop()
 }
 
 /**

@@ -59,11 +59,7 @@ object EventSourcing {
 
   trait EventsourcedActorAPI {
     //#persist-signature
-    def persist[A](event: A, customRoutingDestinations: Set[String] = Set())(handler: Try[A] => Unit): Unit
-    //#
-
-    //#delay-signature
-    def delay[A](command: A)(handler: A => Unit): Unit
+    def persist[A](event: A, customDestinationAggregateIds: Set[String] = Set())(handler: Try[A] => Unit): Unit
     //#
   }
 
@@ -152,6 +148,53 @@ object LoadSnapshot {
         // initialize internal state from loaded snapshot
         state = s
     }
+  }
+  //#
+}
+
+object ClockEntryClass {
+  import akka.actor._
+  import com.rbmhtechnology.eventuate.EventsourcedActor
+
+  //#clock-entry-class
+  class ExampleActor(override val id: String,
+                     override val eventLog: ActorRef) extends EventsourcedActor {
+
+    override def sharedClockEntry: Boolean = false
+
+    // ...
+  //#
+    override val onCommand: Receive = {
+      case cmd => // ...
+    }
+
+    override val onEvent: Receive = {
+      case evt => // ...
+    }
+  //#clock-entry-class
+  }
+  //#
+}
+
+object ClockEntryInstance {
+  import akka.actor._
+  import com.rbmhtechnology.eventuate.EventsourcedActor
+
+  //#clock-entry-instance
+  class ExampleActor(override val id: String,
+                     override val eventLog: ActorRef,
+                     override val sharedClockEntry: Boolean) extends EventsourcedActor {
+
+    // ..
+  //#
+    override val onCommand: Receive = {
+      case cmd => // ...
+    }
+
+    override val onEvent: Receive = {
+      case evt => // ...
+    }
+  //#clock-entry-instance
   }
   //#
 }

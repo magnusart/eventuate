@@ -2,11 +2,11 @@ organization := "com.rbmhtechnology"
 
 name := "eventuate"
 
-version := "0.3-SNAPSHOT"
+version := "0.4-SNAPSHOT"
 
 scalaVersion := "2.11.7"
 
-val akkaVersion = "2.4-M2"
+val akkaVersion = "2.4.0-RC2"
 
 scalacOptions in (Compile, doc) := List("-skip-packages", "akka")
 
